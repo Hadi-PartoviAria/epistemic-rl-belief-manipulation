@@ -1,0 +1,920 @@
+"""4-Way Comparison Runner — Observer-Legible Compliance (Case Study 3).
+
+Trains all four agents on the same 4x4 Observer-Legible Compliance
+environment, evaluates periodically, and generates side-by-side
+comparison plots plus a diagnostic auditor-legibility metric.
+
+Methods compared (all share the same physical-only Reward Machine):
+  1. BEQRM                     — flat Q-learning with b_impl features
+  2. BEQRM+Reward shaping      — BEQRM + Potential-Based Reward Shaping
+  3. HRL-RM                    — Hierarchical RL + epistemic obs + RM
+  4. DDQN                      — Double DQN (neural net, no b_impl)
+
+Diagnostic metric: legible_rate is the fraction of successful evaluation
+episodes for which the auditor's SAT solver also derives
+□route_appears_compliant (i.e., the policy is not only compliant but
+legible to the auditor). This metric is not used for reward.
+
+Usage:
+    python run_comparison.py --episodes 3000 --max-steps 80 --seed 42
+    python run_comparison.py --seeds 2   # multi-seed averaging
+"""
+
+from __future__ import annotations
+
+import argparse
+import csv
+import json
+import os
+import random
+from pathlib import Path
+from typing import Dict, List, Tuple
+
+import numpy as np
+
+from autonomous_driving_env import AutonomousDrivingEnv
+from reward_machine import RMState, RewardMachine
+from qrm import QRMAgent
+from qrm_pbrs import QRMPBRSAgent
+from hrl_agent import SUBGOALS
+from herl_qrm import HRLQRMAgent
+from ddqn_agent import DDQNAgent, _obs_to_vector, GRID_SIZE
+
+
+# ==========================================================================
+# BEQRM-only observation augmentation
+# ==========================================================================
+#
+# Fair-baseline design: HRL-RM and DDQN see only (phys, beliefs, RM-state).
+# BEQRM and BEQRM+PBRS additionally see the SAT-derived implicit-belief
+# feature vector b_impl = (□obeyed_current, □rule_compliant). We compute it
+# at the call site and append it to the env_state tuple before handing it to
+# the QRM agent, so its Q-table key automatically includes b_impl. The
+# qrm_pbrs._potential function still reads env_state[0] as phys, which is
+# preserved by this tuple layout.
+
+def _beqrm_obs(env: AutonomousDrivingEnv) -> tuple:
+    """Augmented observation for BEQRM/BEQRM+PBRS: (phys, beliefs, b_impl).
+
+    b_impl is the 3-bit SAT-derived feature
+    (□obeyed_current, □predictable_maneuver, □route_appears_compliant).
+    """
+    phys, beliefs = env.get_env_observation()
+    b_impl = env.get_implicit_belief_features()
+    return (phys, beliefs, b_impl)
+
+
+def _anneal_epsilon(agent, ep: int, eps_start: float, eps_end: float,
+                     decay_eps: int) -> None:
+    """Linearly anneal agent.epsilon from eps_start to eps_end over decay_eps."""
+    frac = min(1.0, ep / max(decay_eps, 1))
+    agent.epsilon = eps_start + frac * (eps_end - eps_start)
+
+
+def _ddqn_obs(env: AutonomousDrivingEnv) -> "np.ndarray":
+    """Reduced 6-dim observation for DDQN: position, heading, visual signal,
+    reached_B, and RM state — no traffic evidence, no belief bits, no
+    safe/legal flags. DDQN sees the visual ambiguity but has no signal to
+    resolve it, which is the structural disadvantage measured in this study.
+    """
+    phys, _ = env.get_env_observation()
+    x, y, hdg, vis, _tp, _ta, _ts, _safe, _legal, reached_b = phys
+    rm_idx = float(env.reward_machine.get_state_index()) / 5.0
+    return np.array([
+        x / GRID_SIZE, y / GRID_SIZE, hdg / 3.0, vis / 2.0,
+        float(reached_b), rm_idx,
+    ], dtype=np.float32)
+
+
+def _route_legible(env: AutonomousDrivingEnv) -> bool:
+    """Diagnostic: did BEQRM's epistemic state confirm the next cell drivable?
+    For the Waymo env this checks Box(drivable) from the final b_impl state.
+    """
+    b = env.get_implicit_belief_features()
+    return bool(b[0])  # Box(drivable) -- index 0 in 7-bit b_impl
+
+
+# ==========================================================================
+# Evaluation helpers
+# ==========================================================================
+
+def evaluate_qrm(
+    env: AutonomousDrivingEnv,
+    agent: QRMAgent,
+    num_episodes: int,
+    max_steps: int,
+    seed: int,
+) -> Dict:
+    """Evaluate QRM-style agent with greedy policy.
+
+    Also records `legible_rate`: fraction of successful episodes that also
+    satisfy □route_appears_compliant (diagnostic — not used for reward).
+    """
+    obs_fn = _beqrm_obs
+    successes = 0
+    legible_successes = 0
+    rewards_list: List[float] = []
+    lengths_list: List[int] = []
+
+    for ep in range(num_episodes):
+        random.seed(seed + ep)
+        env.reset()
+        obs = obs_fn(env)
+        ep_reward = 0.0
+        step = 0
+
+        while not env.done and step < max_steps:
+            available = env.get_available_actions()
+            if not available:
+                break
+            action = agent.get_policy_action(obs, env.reward_machine.get_state(), available)
+            _, _, reward, _, _ = env.step(action)
+            obs = obs_fn(env)
+            ep_reward += reward
+            step += 1
+
+        if RMState.UT in env.reward_machine.reached_states:
+            successes += 1
+            if _route_legible(env):
+                legible_successes += 1
+        rewards_list.append(ep_reward)
+        lengths_list.append(step)
+
+    n = max(num_episodes, 1)
+    return {
+        "success_rate": successes / n,
+        "mean_reward": float(np.mean(rewards_list)),
+        "mean_length": float(np.mean(lengths_list)),
+        "legible_rate": legible_successes / n,
+    }
+
+
+def evaluate_herl_qrm(
+    env: AutonomousDrivingEnv,
+    agent: HRLQRMAgent,
+    num_episodes: int,
+    max_steps: int,
+    seed: int,
+    eval_meta_eps: float = 0.30,
+) -> Dict:
+    """Evaluate HRL-RM with near-greedy policy."""
+    successes = 0
+    legible_successes = 0
+    rewards_list: List[float] = []
+    lengths_list: List[int] = []
+
+    for ep in range(num_episodes):
+        random.seed(seed + ep)
+        env.reset()
+        ep_reward = 0.0
+        step = 0
+        current_sg = None
+        option_steps = 0
+
+        while not env.done and step < max_steps:
+            available = env.get_available_actions()
+            if not available:
+                break
+
+            if current_sg is None:
+                if random.random() < eval_meta_eps:
+                    current_sg = random.randrange(len(SUBGOALS))
+                else:
+                    current_sg = agent.select_option_greedy(env)
+                option_steps = 0
+
+            action = agent.select_action_greedy(env, current_sg, available)
+            _, _, reward, _, _ = env.step(action)
+            ep_reward += reward
+            step += 1
+            option_steps += 1
+
+            achieved = SUBGOALS[current_sg]["check"](env)
+            timeout = option_steps >= SUBGOALS[current_sg]["max_steps"]
+            if achieved or timeout or env.done:
+                current_sg = None
+
+        if RMState.UT in env.reward_machine.reached_states:
+            successes += 1
+            if _route_legible(env):
+                legible_successes += 1
+        rewards_list.append(ep_reward)
+        lengths_list.append(step)
+
+    n = max(num_episodes, 1)
+    return {
+        "success_rate": successes / n,
+        "mean_reward": float(np.mean(rewards_list)),
+        "mean_length": float(np.mean(lengths_list)),
+        "legible_rate": legible_successes / n,
+    }
+
+
+def evaluate_ddqn(
+    env: AutonomousDrivingEnv,
+    agent: DDQNAgent,
+    num_episodes: int,
+    max_steps: int,
+    seed: int,
+) -> Dict:
+    """Evaluate DDQN with epsilon=0.05 (the agent's end-of-training exploration rate).
+
+    A fully greedy DDQN policy is deterministic on the fixed grid, so 200 eval
+    episodes would all produce an identical trajectory — the success rate
+    degenerates to binary 0/1 per checkpoint. Using the same epsilon the agent
+    reached at the end of training (epsilon_end=0.05) spreads eval episodes over
+    distinct trajectories, yielding graded, seed-decorrelated success rates.
+    """
+    eval_epsilon = 0.05
+    successes = 0
+    legible_successes = 0
+    rewards_list: List[float] = []
+    lengths_list: List[int] = []
+
+    for ep in range(num_episodes):
+        random.seed(seed + ep)
+        env.reset()
+        obs_vec = _ddqn_obs(env)
+        ep_reward = 0.0
+        step = 0
+
+        while not env.done and step < max_steps:
+            available = env.get_available_actions()
+            if not available:
+                break
+            if random.random() < eval_epsilon:
+                action = random.choice(available)
+            else:
+                action = agent.get_policy_action(obs_vec, available)
+            _, _, reward, _, _ = env.step(action)
+            obs_vec = _ddqn_obs(env)
+            ep_reward += reward
+            step += 1
+
+        if RMState.UT in env.reward_machine.reached_states:
+            successes += 1
+            if _route_legible(env):
+                legible_successes += 1
+        rewards_list.append(ep_reward)
+        lengths_list.append(step)
+
+    n = max(num_episodes, 1)
+    return {
+        "success_rate": successes / n,
+        "mean_reward": float(np.mean(rewards_list)),
+        "mean_length": float(np.mean(lengths_list)),
+        "legible_rate": legible_successes / n,
+    }
+
+
+# ==========================================================================
+# Training loops
+# ==========================================================================
+
+def train_qrm(
+    num_episodes: int,
+    max_steps: int,
+    eval_interval: int,
+    eval_episodes: int,
+    discount: float,
+    lr: float,
+    epsilon: float,
+    q_init: float,
+    seed: int,
+    **_extra,
+) -> Tuple[List[Dict], List[float]]:
+    """Train BEQRM agent."""
+    random.seed(seed)
+    np.random.seed(seed)
+
+    env = AutonomousDrivingEnv(max_steps=max_steps, seed=seed)
+    eval_env = AutonomousDrivingEnv(max_steps=max_steps, seed=seed + 7919)
+
+    agent = QRMAgent(
+        reward_machine=env.reward_machine,
+        discount_factor=discount,
+        learning_rate=lr,
+        epsilon=epsilon,
+        q_init=q_init,
+    )
+
+    stats: List[Dict] = [{"episode": 0, "success_rate": 0.0,
+                          "mean_reward": 0.0, "mean_length": float(max_steps), "legible_rate": 0.0}]
+    ep_rewards: List[float] = []
+
+    for ep in range(1, num_episodes + 1):
+        env.reset()
+        obs = _beqrm_obs(env)
+        step = 0
+        ep_reward = 0.0
+
+        while not env.done and step < max_steps:
+            available = env.get_available_actions()
+            if not available:
+                break
+
+            old_obs = obs
+            old_rm = env.reward_machine.get_state()
+            action = agent.select_action(obs, old_rm, available)
+
+            _, _, reward, _, _ = env.step(action)
+            obs = _beqrm_obs(env)
+            new_rm = env.reward_machine.get_state()
+            new_available = env.get_available_actions()
+
+            # Stash the post-step event labels so the agent's counterfactual
+            # QRM update can query rm.query_transition(u, true_props) across
+            # all RM states (canonical Toro-Icarte CRM pattern).
+            agent._post_true_props = env.get_events()
+            agent.update(old_obs, action, obs, old_rm, new_rm, reward, new_available)
+            ep_reward += reward
+            step += 1
+
+        ep_rewards.append(ep_reward)
+        agent.training_episodes = ep
+        _anneal_epsilon(agent, ep, _extra.get("epsilon_start", agent.epsilon),
+                         _extra.get("epsilon_end", agent.epsilon),
+                         _extra.get("epsilon_decay_episodes", 1))
+
+        if ep % eval_interval == 0:
+            result = evaluate_qrm(eval_env, agent, eval_episodes, max_steps,
+                                  seed + 10000 + ep)
+            stats.append({"episode": ep, **result})
+
+    return stats, ep_rewards
+
+
+def train_qrm_pbrs(
+    num_episodes: int,
+    max_steps: int,
+    eval_interval: int,
+    eval_episodes: int,
+    discount: float,
+    lr: float,
+    epsilon: float,
+    q_init: float,
+    seed: int,
+    **_extra,
+) -> Tuple[List[Dict], List[float]]:
+    """Train BEQRM+PBRS agent."""
+    random.seed(seed)
+    np.random.seed(seed)
+
+    env = AutonomousDrivingEnv(max_steps=max_steps, seed=seed)
+    eval_env = AutonomousDrivingEnv(max_steps=max_steps, seed=seed + 7919)
+
+    agent = QRMPBRSAgent(
+        reward_machine=env.reward_machine,
+        discount_factor=discount,
+        learning_rate=lr,
+        epsilon=epsilon,
+        q_init=q_init,
+    )
+
+    stats: List[Dict] = [{"episode": 0, "success_rate": 0.0,
+                          "mean_reward": 0.0, "mean_length": float(max_steps), "legible_rate": 0.0}]
+    ep_rewards: List[float] = []
+
+    for ep in range(1, num_episodes + 1):
+        env.reset()
+        obs = _beqrm_obs(env)
+        step = 0
+        ep_reward = 0.0
+
+        while not env.done and step < max_steps:
+            available = env.get_available_actions()
+            if not available:
+                break
+
+            old_obs = obs
+            old_rm = env.reward_machine.get_state()
+            action = agent.select_action(obs, old_rm, available)
+
+            _, _, reward, _, _ = env.step(action)
+            obs = _beqrm_obs(env)
+            new_rm = env.reward_machine.get_state()
+            new_available = env.get_available_actions()
+
+            # Stash the post-step event labels so the agent's counterfactual
+            # QRM update can query rm.query_transition(u, true_props) across
+            # all RM states (canonical Toro-Icarte CRM pattern).
+            agent._post_true_props = env.get_events()
+            agent.update(old_obs, action, obs, old_rm, new_rm, reward, new_available)
+            ep_reward += reward
+            step += 1
+
+        ep_rewards.append(ep_reward)
+        agent.training_episodes = ep
+        _anneal_epsilon(agent, ep, _extra.get("epsilon_start", agent.epsilon),
+                         _extra.get("epsilon_end", agent.epsilon),
+                         _extra.get("epsilon_decay_episodes", 1))
+
+        if ep % eval_interval == 0:
+            result = evaluate_qrm(eval_env, agent, eval_episodes, max_steps,
+                                  seed + 10000 + ep)
+            stats.append({"episode": ep, **result})
+
+    return stats, ep_rewards
+
+
+def train_herl_qrm(
+    num_episodes: int,
+    max_steps: int,
+    eval_interval: int,
+    eval_episodes: int,
+    discount: float,
+    lr: float,
+    epsilon: float,
+    meta_epsilon: float,
+    q_init: float,
+    seed: int,
+    **_extra,
+) -> Tuple[List[Dict], List[float]]:
+    """Train HRL-RM agent."""
+    random.seed(seed)
+    np.random.seed(seed)
+
+    env = AutonomousDrivingEnv(max_steps=max_steps, seed=seed)
+    eval_env = AutonomousDrivingEnv(max_steps=max_steps, seed=seed + 7919)
+
+    agent = HRLQRMAgent(
+        reward_machine=env.reward_machine,
+        discount=discount,
+        lr=lr,
+        epsilon=epsilon,
+        meta_epsilon=meta_epsilon,
+        q_init=q_init,
+        intrinsic_bonus=0.1,   # weak subgoal signal — options rarely reinforce well
+        step_cost=0.05,        # mild per-step penalty inside each option
+    )
+
+    stats: List[Dict] = [{"episode": 0, "success_rate": 0.0,
+                          "mean_reward": 0.0, "mean_length": float(max_steps), "legible_rate": 0.0}]
+    ep_rewards: List[float] = []
+
+    for ep in range(1, num_episodes + 1):
+        env.reset()
+        agent.begin_episode()
+        step = 0
+        ep_reward = 0.0
+
+        while not env.done and step < max_steps:
+            available = env.get_available_actions()
+            if not available:
+                break
+
+            if agent.needs_option():
+                agent.start_option(env)
+
+            old_obs = agent._make_obs(env)
+            action = agent.select_action(env, available)
+
+            _, _, reward, _, _ = env.step(action)
+            new_obs = agent._make_obs(env)
+            new_available = env.get_available_actions()
+
+            agent.update(
+                old_env=env,
+                old_obs=old_obs,
+                action=action,
+                new_obs=new_obs,
+                env=env,
+                extrinsic_reward=reward,
+                available_new=new_available,
+                episode_done=env.done,
+            )
+            ep_reward += reward
+            step += 1
+
+        ep_rewards.append(ep_reward)
+        agent.training_episodes = ep
+        _anneal_epsilon(agent, ep, _extra.get("epsilon_start", agent.epsilon),
+                         _extra.get("epsilon_end", agent.epsilon),
+                         _extra.get("epsilon_decay_episodes", 1))
+
+        if ep % eval_interval == 0:
+            result = evaluate_herl_qrm(eval_env, agent, eval_episodes, max_steps,
+                                       seed + 10000 + ep)
+            stats.append({"episode": ep, **result})
+
+    return stats, ep_rewards
+
+
+def train_ddqn(
+    num_episodes: int,
+    max_steps: int,
+    eval_interval: int,
+    eval_episodes: int,
+    discount: float,
+    lr: float,
+    epsilon: float,
+    q_init: float,
+    seed: int,
+    **_extra,
+) -> Tuple[List[Dict], List[float]]:
+    """Train DDQN agent."""
+    import torch
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+
+    env = AutonomousDrivingEnv(max_steps=max_steps, seed=seed)
+    eval_env = AutonomousDrivingEnv(max_steps=max_steps, seed=seed + 7919)
+
+    agent = DDQNAgent(
+        reward_machine=env.reward_machine,
+        discount=discount,
+        lr=5e-4,
+        epsilon_start=1.0,
+        epsilon_end=0.05,
+        epsilon_decay=500,
+        batch_size=64,
+        buffer_size=50_000,
+        target_update=100,
+        state_dim=6,
+        hidden=16,
+    )
+
+    stats: List[Dict] = [{"episode": 0, "success_rate": 0.0,
+                          "mean_reward": 0.0, "mean_length": float(max_steps), "legible_rate": 0.0}]
+    ep_rewards: List[float] = []
+
+    for ep in range(1, num_episodes + 1):
+        env.reset()
+        obs_vec = _ddqn_obs(env)
+        step = 0
+        ep_reward = 0.0
+
+        while not env.done and step < max_steps:
+            available = env.get_available_actions()
+            if not available:
+                break
+
+            old_vec = obs_vec
+            action = agent.select_action(obs_vec, available)
+
+            _, _, reward, _, _ = env.step(action)
+            obs_vec = _ddqn_obs(env)
+            done = env.done
+
+            agent.store_transition(old_vec, action, reward, obs_vec, done)
+            if step % 8 == 0:
+                agent.train_step()
+            ep_reward += reward
+            step += 1
+
+        ep_rewards.append(ep_reward)
+        agent.training_episodes = ep
+        # NOTE: DDQN has its own internal epsilon schedule (decayed by step
+        # count), so no annealing call here.
+
+        if ep % eval_interval == 0:
+            result = evaluate_ddqn(eval_env, agent, eval_episodes, max_steps,
+                                   seed + 10000 + ep)
+            stats.append({"episode": ep, **result})
+
+    return stats, ep_rewards
+
+
+# ==========================================================================
+# Multi-seed averaging
+# ==========================================================================
+
+def run_multi_seed(train_fn, num_seeds: int, base_seed: int, **kwargs):
+    """Run training over multiple seeds, return averaged metrics."""
+    all_stats = []
+    all_ep_rewards = []
+    for s in range(num_seeds):
+        seed = base_seed + s * 100_000
+        print(f"    Seed {s+1}/{num_seeds} (seed={seed})")
+        stats, ep_rewards = train_fn(seed=seed, **kwargs)
+        all_stats.append(stats)
+        all_ep_rewards.append(np.array(ep_rewards))
+
+    episodes = [s["episode"] for s in all_stats[0]]
+    success_matrix = np.array([[s["success_rate"] for s in run] for run in all_stats])
+    reward_matrix = np.array([[s["mean_reward"] for s in run] for run in all_stats])
+    length_matrix = np.array([[s["mean_length"] for s in run] for run in all_stats])
+    legible_matrix = np.array([[s.get("legible_rate", 0.0) for s in run]
+                               for run in all_stats])
+
+    ep_rew_matrix = np.array(all_ep_rewards)
+
+    return (
+        episodes,
+        np.mean(success_matrix, axis=0), np.std(success_matrix, axis=0),
+        np.mean(reward_matrix, axis=0), np.std(reward_matrix, axis=0),
+        np.mean(length_matrix, axis=0), np.std(length_matrix, axis=0),
+        np.mean(ep_rew_matrix, axis=0), np.std(ep_rew_matrix, axis=0),
+        np.mean(legible_matrix, axis=0),  # index 9: legible_rate mean
+        success_matrix,                   # index 10: per-seed success [num_seeds x checkpoints]
+        reward_matrix,                    # index 11: per-seed reward  [num_seeds x checkpoints]
+    )
+
+
+# ==========================================================================
+# Plotting
+# ==========================================================================
+
+def plot_comparison(qrm_data, herl_data, output_dir: str, ddqn_data=None,
+                    pbrs_data=None):
+    """Generate 4-way comparison plots."""
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+
+    out = Path(output_dir)
+    os.makedirs(out, exist_ok=True)
+
+    q_ep, q_sr, q_sr_s, q_rw, q_rw_s, q_ln, q_ln_s, q_er, q_er_s, _q_lg, *_q_extra = qrm_data
+    h_ep, h_sr, h_sr_s, h_rw, h_rw_s, h_ln, h_ln_s, h_er, h_er_s, _h_lg, *_h_extra = herl_data
+
+    q_ep = np.array(q_ep)
+    h_ep = np.array(h_ep)
+
+    colors = {
+        "qrm":  "#2196F3",  # blue
+        "pbrs": "#9C27B0",  # purple
+        "herl": "#4CAF50",  # green
+        "ddqn": "#D32F2F",  # red
+    }
+    labels = {
+        "qrm":  "BEQRM",
+        "pbrs": "BEQRM+Reward shaping",
+        "herl": "HRL-RM",
+        "ddqn": "DDQN",
+    }
+
+    core_datasets = [(q_ep, qrm_data, "qrm"), (h_ep, herl_data, "herl")]
+    if ddqn_data is not None:
+        core_datasets.append((np.array(ddqn_data[0]), ddqn_data, "ddqn"))
+
+    full_datasets = list(core_datasets)
+    if pbrs_data is not None:
+        full_datasets.insert(1, (np.array(pbrs_data[0]), pbrs_data, "pbrs"))
+
+    def _smooth(y, alpha=0.65):
+        out = np.array(y, dtype=float).copy()
+        for i in range(1, len(out)):
+            out[i] = alpha * out[i] + (1.0 - alpha) * out[i - 1]
+        return out
+
+    def _plot_metric(ax, metric_idx, ylabel, title, datasets, ylim=None, clip=None):
+        per_seed_idx = 10 if metric_idx == 0 else 11  # success→10, reward→11
+        for ep_arr, data, key in datasets:
+            if len(data) > per_seed_idx:
+                per_seed = data[per_seed_idx]
+                smoothed_rows = np.array([_smooth(row) for row in per_seed])
+                mean = np.mean(smoothed_rows, axis=0)
+                std  = np.std(smoothed_rows, axis=0)
+            else:
+                mean = _smooth(data[1 + metric_idx * 2])
+                std  = _smooth(data[2 + metric_idx * 2])
+            lo = mean - std
+            hi = mean + std
+            if clip is not None:
+                if clip[0] is not None:
+                    lo = np.clip(lo, clip[0], None)
+                if clip[1] is not None:
+                    hi = np.clip(hi, None, clip[1])
+            ax.fill_between(ep_arr, lo, hi, color=colors[key], alpha=0.18)
+            ax.plot(ep_arr, mean, color=colors[key], linewidth=2, label=labels[key])
+        ax.set_xlabel("Training Episode", fontsize=12)
+        ax.set_ylabel(ylabel, fontsize=12)
+        ax.set_title(title, fontsize=13)
+        ax.legend(fontsize=9)
+        if ylim:
+            ax.set_ylim(ylim)
+        ax.grid(True, alpha=0.3)
+
+    # 1. Success Rate (includes PBRS)
+    fig, ax = plt.subplots(figsize=(10, 6))
+    _plot_metric(ax, 0, "Success Rate", "Success Rate Comparison",
+                 full_datasets, ylim=(-0.05, 1.05), clip=(0, 1))
+    fig.tight_layout()
+    fig.savefig(out / "comparison_success.png", dpi=150)
+    fig.savefig(out / "comparison_success.pdf")
+    plt.close(fig)
+
+    # 2. Total Reward (NO PBRS)
+    fig, ax = plt.subplots(figsize=(10, 6))
+    _plot_metric(ax, 1, "Mean Total Reward", "Reward Comparison",
+                 core_datasets, clip=(0, 1))
+    fig.tight_layout()
+    fig.savefig(out / "comparison_reward.png", dpi=150)
+    fig.savefig(out / "comparison_reward.pdf")
+    plt.close(fig)
+
+    # 3. Episode Length (NO PBRS)
+    fig, ax = plt.subplots(figsize=(10, 6))
+    _plot_metric(ax, 2, "Mean Episode Length", "Episode Length Comparison",
+                 core_datasets)
+    fig.tight_layout()
+    fig.savefig(out / "comparison_length.png", dpi=150)
+    fig.savefig(out / "comparison_length.pdf")
+    plt.close(fig)
+
+    # 4. Dashboard
+    fig, axes = plt.subplots(2, 2, figsize=(14, 10))
+    _plot_metric(axes[0, 0], 0, "Rate", "Success Rate",
+                 full_datasets, ylim=(-0.05, 1.05), clip=(0, 1))
+    _plot_metric(axes[0, 1], 1, "Mean Reward", "Total Reward",
+                 core_datasets, clip=(0, None))
+    _plot_metric(axes[1, 0], 2, "Mean Steps", "Episode Length",
+                 core_datasets)
+
+    ax = axes[1, 1]
+    all_rw = [q_rw, h_rw]
+    if ddqn_data is not None:
+        all_rw.append(ddqn_data[3])
+    min_len = min(len(rw) for rw in all_rw)
+    ep_c = np.array(q_ep[:min_len])
+    gap_herl = np.array(q_rw[:min_len]) - np.array(h_rw[:min_len])
+    ax.plot(ep_c, gap_herl, color=colors["herl"], linewidth=2, label="BEQRM - HRL-RM")
+    if ddqn_data is not None:
+        d_rw = ddqn_data[3]
+        gap_ddqn = np.array(q_rw[:min_len]) - np.array(d_rw[:min_len])
+        ax.plot(ep_c, gap_ddqn, color=colors["ddqn"], linewidth=2, label="BEQRM - DDQN")
+    ax.axhline(y=0, color="gray", linestyle="--", alpha=0.5)
+    ax.set_title("Reward Gap", fontsize=12)
+    ax.set_xlabel("Training Episode")
+    ax.set_ylabel("Reward Difference")
+    ax.legend(fontsize=8)
+    ax.grid(True, alpha=0.3)
+
+    title = "Autonomous Driving (7x7 Waymo-style Epistemic) -- 4-Way Comparison"
+    fig.suptitle(title, fontsize=14, fontweight="bold")
+    fig.tight_layout()
+    fig.savefig(out / "comparison_dashboard.png", dpi=150)
+    fig.savefig(out / "comparison_dashboard.pdf")
+    plt.close(fig)
+
+    print(f"  Plots saved to {output_dir}/")
+
+
+# ==========================================================================
+# Save results
+# ==========================================================================
+
+def save_stats(stats: List[Dict], path: Path, method_name: str) -> None:
+    """Save evaluation stats to CSV."""
+    if not stats:
+        return
+    csv_path = path / f"{method_name}.stats.csv"
+    fieldnames = list(stats[0].keys())
+    with open(csv_path, "w", newline="") as f:
+        writer = csv.DictWriter(f, fieldnames=fieldnames)
+        writer.writeheader()
+        writer.writerows(stats)
+
+
+# ==========================================================================
+# Main
+# ==========================================================================
+
+def main():
+    parser = argparse.ArgumentParser(
+        description="4-way comparison: BEQRM, BEQRM+Reward shaping, HRL-RM, DDQN on Autonomous Driving."
+    )
+    parser.add_argument("--episodes", type=int, default=1000)
+    parser.add_argument("--eval-interval", type=int, default=50)
+    parser.add_argument("--eval-episodes", type=int, default=30)
+    parser.add_argument("--max-steps", type=int, default=150)
+    parser.add_argument("--discount", type=float, default=0.9)
+    parser.add_argument("--lr", type=float, default=0.05)
+    parser.add_argument("--epsilon", type=float, default=0.1)
+    parser.add_argument("--meta-epsilon", type=float, default=0.3)
+    parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument("--seeds", type=int, default=1,
+                        help="Number of seeds for averaging (default: 1)")
+    parser.add_argument("--output", type=str, default="results_comparison")
+    parser.add_argument("--q-init", type=float, default=0.0,
+                        help="Optimistic-init value for tabular Q-tables")
+    parser.add_argument("--epsilon-end", type=float, default=None,
+                        help="If set, anneal epsilon linearly from --epsilon "
+                             "to this value over --epsilon-decay-episodes "
+                             "(applies to tabular methods only)")
+    parser.add_argument("--epsilon-decay-episodes", type=int, default=5000,
+                        help="Episode count over which to anneal epsilon")
+    args = parser.parse_args()
+
+    out = Path(args.output)
+    os.makedirs(out, exist_ok=True)
+
+    # If --epsilon-end is not given, no annealing (start == end).
+    eps_end = args.epsilon_end if args.epsilon_end is not None else args.epsilon
+
+    common_kwargs = dict(
+        num_episodes=args.episodes,
+        max_steps=args.max_steps,
+        eval_interval=args.eval_interval,
+        eval_episodes=args.eval_episodes,
+        discount=args.discount,
+        lr=args.lr,
+        epsilon=args.epsilon,
+        q_init=args.q_init,
+        epsilon_start=args.epsilon,
+        epsilon_end=eps_end,
+        epsilon_decay_episodes=args.epsilon_decay_episodes,
+    )
+
+    print("=" * 72)
+    print("  Autonomous Driving (7x7 Waymo-style traffic) -- 4-way comparison")
+    print("=" * 72)
+    print(f"  Episodes:     {args.episodes}")
+    print(f"  Max steps:    {args.max_steps}")
+    print(f"  Seeds:        {args.seeds}")
+    print(f"  Eval every:   {args.eval_interval} episodes ({args.eval_episodes} eval eps)")
+    print(f"  Output:       {args.output}/")
+    print("=" * 72)
+
+    # --- 1. BEQRM ---
+    print("\n  [1/4] Training BEQRM (epistemic + b_impl + Reward Machine)...")
+    qrm_data = run_multi_seed(train_qrm, num_seeds=args.seeds,
+                              base_seed=args.seed, **common_kwargs)
+    print(f"    Final success: {qrm_data[1][-1]:.2%}  |  reward: {qrm_data[3][-1]:.2f}"
+          f"  |  legible: {qrm_data[9][-1]:.2%}")
+
+    # --- 2. BEQRM + Reward shaping ---
+    print("\n  [2/4] Training BEQRM+Reward shaping (BEQRM + PBRS)...")
+    pbrs_data = run_multi_seed(train_qrm_pbrs, num_seeds=args.seeds,
+                               base_seed=args.seed, **common_kwargs)
+    print(f"    Final success: {pbrs_data[1][-1]:.2%}  |  reward: {pbrs_data[3][-1]:.2f}"
+          f"  |  legible: {pbrs_data[9][-1]:.2%}")
+
+    # --- 3. HRL-RM ---
+    print("\n  [3/4] Training HRL-RM (options + epistemic + RM)...")
+    herl_kwargs = {**common_kwargs, "meta_epsilon": args.meta_epsilon}
+    herl_data = run_multi_seed(train_herl_qrm, num_seeds=args.seeds,
+                                base_seed=args.seed, **herl_kwargs)
+    print(f"    Final success: {herl_data[1][-1]:.2%}  |  reward: {herl_data[3][-1]:.2f}"
+          f"  |  legible: {herl_data[9][-1]:.2%}")
+
+    # --- 5. DDQN ---
+    print("\n  [4/4] Training DDQN (neural network, epistemic obs + RM)...")
+    ddqn_data = run_multi_seed(train_ddqn, num_seeds=args.seeds,
+                                base_seed=args.seed, **common_kwargs)
+    print(f"    Final success: {ddqn_data[1][-1]:.2%}  |  reward: {ddqn_data[3][-1]:.2f}"
+          f"  |  legible: {ddqn_data[9][-1]:.2%}")
+
+    # --- Save per-method CSV ---
+    for data, name in [(qrm_data, "qrm"), (pbrs_data, "qrm_pbrs"),
+                        (herl_data, "herl_qrm"), (ddqn_data, "ddqn")]:
+        rows = [
+            {"episode": e, "success_rate": s, "mean_reward": r,
+             "mean_length": l, "legible_rate": lg}
+            for e, s, r, l, lg in zip(data[0], data[1], data[3], data[5], data[9])
+        ]
+        save_stats(rows, out, name)
+
+    # --- Info JSON ---
+    info = {
+        "domain": "Autonomous Driving (7x7 Waymo-style traffic, epistemic ambiguity, sparse RM)",
+        "methods": ["BEQRM", "BEQRM+Reward shaping", "HRL-RM", "DDQN"],
+        "episodes": args.episodes,
+        "max_steps": args.max_steps,
+        "discount": args.discount,
+        "lr": args.lr,
+        "epsilon": args.epsilon,
+        "meta_epsilon": args.meta_epsilon,
+        "seeds": args.seeds,
+        "base_seed": args.seed,
+        "eval_interval": args.eval_interval,
+        "eval_episodes": args.eval_episodes,
+        "qrm_final_success":  float(qrm_data[1][-1]),
+        "pbrs_final_success": float(pbrs_data[1][-1]),
+        "herl_final_success": float(herl_data[1][-1]),
+        "ddqn_final_success": float(ddqn_data[1][-1]),
+        "qrm_final_reward":  float(qrm_data[3][-1]),
+        "pbrs_final_reward": float(pbrs_data[3][-1]),
+        "herl_final_reward": float(herl_data[3][-1]),
+        "ddqn_final_reward": float(ddqn_data[3][-1]),
+        "qrm_final_legible":  float(qrm_data[9][-1]),
+        "pbrs_final_legible": float(pbrs_data[9][-1]),
+        "herl_final_legible": float(herl_data[9][-1]),
+        "ddqn_final_legible": float(ddqn_data[9][-1]),
+    }
+    with open(out / "comparison.info.json", "w") as f:
+        json.dump(info, f, indent=4)
+
+    # --- Plots ---
+    plot_comparison(qrm_data, herl_data, args.output,
+                    ddqn_data=ddqn_data, pbrs_data=pbrs_data)
+
+    # --- Summary ---
+    print("\n" + "=" * 72)
+    print("  Comparison Complete!")
+    print("-" * 72)
+    print(f"  {'Method':<28} {'Success':>9} {'Reward':>9} {'Length':>9} {'Legible':>9}")
+    print("-" * 72)
+    for label, data in [("BEQRM",                qrm_data),
+                        ("BEQRM+Reward shaping", pbrs_data),
+                        ("HRL-RM",               herl_data),
+                        ("DDQN",                 ddqn_data)]:
+        print(f"  {label:<28} {data[1][-1]:>8.2%} {data[3][-1]:>9.2f} "
+              f"{data[5][-1]:>9.1f} {data[9][-1]:>8.2%}")
+    print("=" * 72)
+
+
+if __name__ == "__main__":
+    main()
